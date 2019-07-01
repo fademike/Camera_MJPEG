@@ -1,0 +1,709 @@
+//---------------------------------------------------------------------------
+#include <stdio.h>
+
+
+#include <vcl.h>
+#pragma hdrstop
+
+#include "Unit1.h"
+#include <jpeg.hpp>
+//---------------------------------------------------------------------------
+#pragma package(smart_init)
+/*#pragma link "Button"
+#pragma link "ComboBox"
+#pragma link "Memo"
+#pragma link "Label"
+//#pragma link "Edit"
+//#pragma link "TrackBar"
+#pragma link "sButton"
+#pragma link "sComboBox"
+#pragma link "sMemo"    */
+#pragma resource "*.dfm"
+TForm1 *Form1;
+HANDLE COMport = 0;;
+DWORD WINAPI ThreadRead(LPVOID lpParam);
+DWORD WINAPI ThreadFindJPEG(LPVOID lpParam);  
+DWORD WINAPI ThreadShowJPEG(LPVOID lpParam);
+
+int COMOpen(String portname);
+void COMClose(void);
+HANDLE reader, findJPEG, showJPEG;
+OVERLAPPED overlapped;
+OVERLAPPED overlappedwr;
+
+FILE * pFile;
+
+unsigned int r_fps = 0;  
+unsigned int r_fps_err = 0;
+unsigned int r_bitrate = 0;
+HANDLE reView;
+
+
+bool IMG_ready = false;
+bool IMG_save = false; 
+int IMG_save_num = 0;
+
+char BUFFER_file[1024*1024];
+int BUFFER_array;
+
+
+
+void Find_Com(void)                                                             // Find COM Port
+{
+String com_text;
+unsigned int i=0;
+HANDLE Cport;
+bool first = false;
+String com_name = "";
+
+com_name = "";
+for (i=0; i<100; i++)
+{
+com_text = "";
+com_text = com_text + "\\\\.\\" + "COM" + i + "\0";
+
+Cport = CreateFile(com_text.c_str(),GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+if(Cport != INVALID_HANDLE_VALUE)  {
+CloseHandle(Cport);
+
+if(!first){Form1->ComboBox1->Text = com_name +"COM" + (i); first = true;}
+com_name = com_name + "COM" + (i) + "\n";
+
+}
+}
+if (!first) Form1->ComboBox1->Text = "";
+Form1->ComboBox1->Items->Text = com_name;
+}
+
+
+
+void SendChar(unsigned char dd)
+{
+
+DWORD temp, signal;
+bool fl=0;
+
+WriteFile(COMport, &dd, 1, &temp, &overlappedwr);
+   signal = WaitForSingleObject(overlappedwr.hEvent, INFINITE);
+ if((signal == WAIT_OBJECT_0) && (GetOverlappedResult(COMport, &overlappedwr, &temp, true))) fl = true;
+ else fl = false;
+
+}
+
+
+
+//=============================================================================
+//........................... ????????? ??????? ..............................
+//=============================================================================
+
+//---------------------------------------------------------------------------
+
+int COMOpen(String portname)
+{
+ //String portname;					//имя порта (например, "COM1", "COM2" и т.д.)
+ DCB dcb;						//структура для общей инициализации порта DCB
+ COMMTIMEOUTS timeouts;					//структура для установки таймаутов
+ String COMportNAME = "\\\\.\\" + portname;
+ //portname = Form1->ComboBox1->Text;
+ //portname = "COM1";
+
+			//  COMportNAME="COM2";
+//открыть порт, для асинхронных операций обязательно нужно указать флаг FILE_FLAG_OVERLAPPED
+// COMport = CreateFile(AnsiString(portname.c_str()).c_str(),GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+ COMport = CreateFile(AnsiString(COMportNAME.c_str()).c_str(),GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+// COMport = CreateFile(UnicodeString(COMportNAME.c_str()).w_str(),GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+// COMport = CreateFile("COM1",GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+
+
+//здесь:
+ // - portname.c_str() - имя порта в качестве имени файла,
+ //   c_str() преобразует строку типа String в строку в виде массива типа char, иначе функция не примет
+ // - GENERIC_READ | GENERIC_WRITE - доступ к порту на чтение/записть
+ // - 0 - порт не может быть общедоступным (shared)
+ // - NULL - дескриптор порта не наследуется, используется дескриптор безопасности по умолчанию
+ // - OPEN_EXISTING - порт должен открываться как уже существующий файл
+ // - FILE_FLAG_OVERLAPPED - этот флаг указывает на использование асинхронных операций
+ // - NULL - указатель на файл шаблона не используется при работе с портами
+
+
+ if(COMport == INVALID_HANDLE_VALUE)
+  {
+   //Form1->SpeedButton1->Down = false;     SetComPort=0;
+   //Form1->StatusBar1->Panels->Items[0]->Text = "Не удалось открыть порт";
+   //Form1->Label31->Caption="Не удалось открыть порт";
+   Form1->Memo1->Lines->Add("Com port can't open");
+   return 1;
+  }
+
+
+//if(!SetupComm(COMport, 2048, 2048)) {Form1->Memo1->Lines->Add("?? ??????? (((");return 1; } //МБ не надо!
+
+//инициализация порта
+
+ dcb.DCBlength = sizeof(DCB);	//в первое поле структуры DCB необходимо занести её длину,
+				//она будет использоваться функциями настройки порта
+				//для контроля корректности структуры
+
+//считать структуру DCB из порта
+ if(!GetCommState(COMport, &dcb))
+  {
+//если не удалось - закрыть порт и вывести сообщение об ошибке в строке состояния
+   COMClose();
+   //Form1->StatusBar1->Panels->Items[0]->Text  = "Не удалось считать DCB";
+String qq = "Can't read DCB, "; qq +=String(GetLastError());
+   Form1->Memo1->Lines->Add(qq);
+   return 1;
+  }
+
+//инициализация структуры DCB
+ dcb.BaudRate = 115200*20;//115200*28;  //115200*16; = 1843200 = 184'320 byte/s = 1'474'560 bit/s;
+ dcb.fBinary = TRUE;			//включаем двоичный режим обмена
+ dcb.fOutxCtsFlow = FALSE;		//выключаем режим слежения за сигналом CTS
+ dcb.fOutxDsrFlow = FALSE;		//выключаем режим слежения за сигналом DSR
+ dcb.fDtrControl = DTR_CONTROL_ENABLE; 	//отключаем использование линии DTR
+ dcb.fDsrSensitivity = FALSE;		//отключаем восприимчивость драйвера к состоянию линии DSR
+ dcb.fNull = FALSE;			//разрешить приём нулевых байтов
+ dcb.fRtsControl = RTS_CONTROL_ENABLE; 	//отключаем использование линии RTS
+ dcb.fAbortOnError = FALSE;		//отключаем остановку всех операций чтения/записи при ошибке
+ dcb.ByteSize = 8;			//задаём 8 бит в байте
+ dcb.Parity = 0;			//отключаем проверку чётности
+ dcb.StopBits = 0;			//задаём один стоп-бит
+
+//загрузить структуру DCB в порт
+ if(!SetCommState(COMport, &dcb))
+  {
+//если не удалось - закрыть порт и вывести сообщение об ошибке в строке состояния
+   COMClose();
+   //Form1->StatusBar1->Panels->Items[0]->Text  = "Не удалось установить DCB";
+   //Form1->Label31->Caption="Не удалось установить DCB";
+   Form1->Memo1->Lines->Add("Не удалось установить DCB");
+   return 1;
+  }
+
+ timeouts.ReadIntervalTimeout = 1000;           //таймаут между двумя символами
+ timeouts.ReadTotalTimeoutMultiplier = 150;    //общий таймаут операции чтения
+ timeouts.ReadTotalTimeoutConstant = 1000;      //константа для общего таймаута операции чтения
+ timeouts.WriteTotalTimeoutMultiplier = 150;   //общий таймаут операции записи
+ timeouts.WriteTotalTimeoutConstant = 1000;     //константа для общего таймаута операции записи
+
+//записать структуру таймаутов в порт
+ //если не удалось - закрыть порт и вывести сообщение об ошибке в строке состояния
+ if(!SetCommTimeouts(COMport, &timeouts))
+  {
+   COMClose();
+   Form1->Memo1->Lines->Add("Не удалось установить тайм-ауты");
+   return 1;
+  }
+
+//установить размеры очередей приёма и передачи
+ SetupComm(COMport,200000,200000);// SetupComm(COMport,2000,2000);
+
+//очистить принимающий буфер порта
+ PurgeComm(COMport, PURGE_RXCLEAR);
+
+//создать и запустить поток чтения байтов
+reader = CreateThread(NULL, 0, ThreadRead, NULL, 0, NULL);
+
+findJPEG = CreateThread(NULL, 0, ThreadFindJPEG, NULL, 0, NULL);
+SetThreadPriority(findJPEG,THREAD_PRIORITY_HIGHEST);
+
+//showJPEG = CreateThread(NULL, 0, ThreadShowJPEG, NULL, 0, NULL);
+//SetThreadPriority(showJPEG,THREAD_PRIORITY_HIGHEST);
+	return 0;
+}
+
+
+void COMClose()
+{    if (COMport == 0) return;
+ if(reader)
+  {TerminateThread(reader,0);
+//   CloseHandle(overlapped.hEvent);
+   CloseHandle(reader);
+  }
+
+  if(findJPEG)
+  {TerminateThread(findJPEG,0);
+   CloseHandle(findJPEG);
+  }
+
+
+
+ CloseHandle(COMport);
+ COMport=0;
+
+}
+
+bool isFirstCMD = false;
+unsigned char currentKS = 0;
+unsigned char trueKS = 0;
+unsigned int sizeIMG = 0;  
+unsigned int readIMG = 0;
+unsigned char currPos = 0;  
+unsigned char nIMG = 0;
+//      unsigned int yyy = 0;
+ //     unsigned char hbuf[1024];
+//      unsigned int i_hbuf = 0;
+
+unsigned char JPEG_HEADER[16] = {0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4a, 0x46,
+                                0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x00};
+int JPED_pos = 0;
+
+
+                                                TMemoryStream * as = new TMemoryStream();
+
+                                                TJPEGImage *jpeg = new TJPEGImage;
+                                                TMemoryStream * as2 = new TMemoryStream();
+                                                TJPEGImage *jpeg2 = new TJPEGImage;
+                                                bool JPEG_Ready = false;    
+                                                bool firstIMG = true;
+
+#define  BUFF_SIZE 1024*1024*5     //255
+
+ unsigned char bufrd_rez[BUFF_SIZE];
+
+// unsigned char bufrd_rez[BUFF_SIZE][255];
+// unsigned char num_rez[BUFF_SIZE];
+unsigned int index_buf_num = 0;
+unsigned int index_buf_wr = 0;
+unsigned int index_buf_rd = 0;
+
+
+DWORD WINAPI ThreadRead(LPVOID lpParam)                                         //ThreadRead
+{
+
+ COMSTAT comstat;		//структура текущего состояния порта, в данной программе используется
+				//для определения количества принятых в порт байтов
+ DWORD temp, mask, signal;	//переменная temp используется в качестве заглушки
+// unsigned char bufrd_rez[1024];
+
+//создать сигнальный объект-событие для асинхронных операций
+ overlapped.hEvent = CreateEvent(NULL, true, true, NULL);
+
+//установить маску на срабатывание по событию приёма байта в порт
+ SetCommMask(COMport, EV_RXCHAR);
+ while(1)
+  {
+//ожидать события приёма байта (это и есть перекрываемая операция)
+   WaitCommEvent(COMport, &mask, &overlapped);
+   signal = WaitForSingleObject(overlapped.hEvent, 1);//INFINITE);	//приостановить поток до прихода байта
+   if(signal == WAIT_OBJECT_0)						//если событие прихода байта произошло
+    {
+     if(GetOverlappedResult(COMport, &overlapped, &temp, true))		//проверяем, успешно ли завершилась
+									//перекрываемая операция WaitCommEvent
+      if((mask & EV_RXCHAR)!=0)						//если произошло именно событие прихода байта
+       {
+        ClearCommError(COMport, &temp, &comstat);			//нужно заполнить структуру COMSTAT
+        unsigned char btr = comstat.cbInQue;						//и получить из неё количество принятых байтов
+        if(btr)								//если действительно есть байты для чтения
+        {
+        unsigned char buf_temp[1024]; //[255]
+
+		 ReadFile(COMport, buf_temp, btr, &temp, &overlapped);	//прочитать байты из порта в буфер программы
+
+
+                 	unsigned char cnt=0;
+			for (cnt = 0; cnt < btr; cnt++) {
+                        bufrd_rez[index_buf_wr] = buf_temp[cnt];
+                        r_bitrate+=8;
+
+                        if(index_buf_wr >= (BUFF_SIZE-1)) {index_buf_wr =0;} else {index_buf_wr++;  }      }
+
+
+		}
+	   }
+	}
+  }
+}
+
+
+//---------------------------------------------------------------------------
+
+
+
+
+
+
+
+DWORD WINAPI ThreadFindJPEG(LPVOID lpParam)                                         //ThreadFindJPEG
+{
+
+
+ while(true)
+  {
+
+
+while (index_buf_rd != index_buf_wr) {
+
+                        unsigned char RxDtat = (bufrd_rez[index_buf_rd]&0xFF);
+
+                      if(index_buf_rd >= (BUFF_SIZE-1)) {index_buf_rd =0;} else {index_buf_rd++;  }
+
+
+                                if(currPos == 0){
+                                        if(RxDtat == 0x01)currPos=1;
+                                        currentKS = 0;
+                                        sizeIMG = 0;
+
+                                }
+                                else if((currPos >= 1) && (currPos<=7) ){
+                                        if (currPos == 1)     { if (RxDtat == 'J') currPos++; else currPos = 0; }
+                                        else if (currPos == 2){ if (RxDtat == 'P') currPos++; else currPos = 0; }
+                                        else if (currPos == 3){ if (RxDtat == 'E') currPos++; else currPos = 0; }
+                                        else if (currPos == 4){ if (RxDtat == 'G') currPos++; else currPos = 0; }
+                                        else if (currPos == 5){ if (RxDtat == '1') currPos++; else currPos = 0; }
+                                        else if (currPos == 6){ if (RxDtat == '.') currPos++; else currPos = 0; }
+                                        else if (currPos == 7){ if (RxDtat == '0') currPos++; else currPos = 0; }
+                                        else {Form1->Memo1->Lines->Add("err" + RxDtat);currPos=0;}
+
+                                        currentKS ^= RxDtat;
+                                }
+                                else if((currPos >= 8) && (currPos<=11) ){
+                                        sizeIMG = sizeIMG<<8;
+                                        sizeIMG |= RxDtat;
+                                        currentKS ^= RxDtat;
+                                        currPos++;
+                                }
+                                else if(currPos == 12){
+                                        readIMG = sizeIMG;
+                                        trueKS = RxDtat;
+                                        if (trueKS == currentKS)
+                                        {
+
+                                                currPos++;
+                                                currentKS = 0;
+
+                                                JPED_pos = 0;
+                                                AnsiString tempStr;
+                                                tempStr += "";
+                                                tempStr += sizeIMG;
+                                                tempStr += " byte";  //  байт;
+                                                Form1->Label3->Caption = tempStr;
+
+
+                                                as->Position = 0;
+                                                BUFFER_array = 0;
+
+
+                                        }
+                                        else {currPos = 0; Form1->Memo1->Lines->Add("KS1 false"); r_fps_err++;}
+                                }
+                                else if(currPos == 13){
+                                        if (readIMG--)
+                                        {
+                                                        as->Write(&RxDtat, 1);
+                                                        BUFFER_file[BUFFER_array++] = RxDtat;
+                                                        currentKS ^= RxDtat;
+                                        }
+                                        else {
+                                                trueKS = RxDtat;
+                                                currPos = 0;
+
+                                                if (trueKS == currentKS)  {
+                                                //PurgeComm(COMport, PURGE_RXCLEAR); // очистим rx буфер
+                                                
+                                                        r_fps++;
+
+
+                                                        try{
+                                                        as->Seek(0,0);
+                                                        jpeg->LoadFromStream(as);
+
+                                                        Form1->DoubleBuffered=true;
+                                                        if(jpeg->Height<100) {Form1->Memo1->Lines->Add("Error JPEG"); return -1; }
+
+                                                                Form1->Image1->Picture->Bitmap->Assign(jpeg);
+
+
+                                                                if(IMG_save)
+                                                                {
+                                                                        FILE * pFile;
+                                                                        String wFile = "img\\myfileimage_";
+                                                                        wFile+= IMG_save_num++;  
+                                                                        wFile+= ".jpg";
+                                                                        pFile = fopen (wFile.c_str(),"wb");
+                                                                        fwrite(BUFFER_file, sizeof(char), BUFFER_array, pFile);
+                                                                        //fputc (as->Read(sizeIMG),pFile);
+                                                                        IMG_save = false;
+                                                                        if(pFile) fclose (pFile);
+                                                                }
+
+                                                        if(!Form1->CheckBox1->Checked)  {
+                                                                Form1->Image1->Picture->Bitmap->Assign(jpeg);
+                                                                Form1->Image1->Visible = true;
+                                                                Form1->Image2->Visible = false;
+                                                        }
+                                                        else
+                                                        {
+                                                                Graphics::TBitmap * Bitmap = new Graphics::TBitmap;
+                                                                TRect RectNew( 0, 0, 800, 600 );
+
+                                                                //Form1->DoubleBuffered=true;
+
+                                                                Bitmap->Width = RectNew.Width( );
+                                                                Bitmap->Height = RectNew.Height( );
+
+                                                                //Bitmap->Canvas->StretchDraw(RectNew, jpeg);
+
+                                                                Bitmap->Canvas->StretchDraw(RectNew, jpeg);
+                                                                //Bitmap->Canvas->Assign(jpeg);
+                                                                               
+                                                                Bitmap->Width = RectNew.Width( );
+                                                                Bitmap->Height = RectNew.Height( );
+
+
+                                                                //Form1->Image2->Picture->Bitmap->Assign(Bitmap);
+                                                                //Form1->Image2->Canvas->Draw(0,0,Bitmap);
+                                                                Form1->Canvas->Draw(Form1->Image2->Left,Form1->Image2->Top,Bitmap);
+
+                                                                //Form1->Image2->Canvas->StretchDraw(RectNew, Bitmap);
+                                                                //Form1->Image1->Picture->Assign(Bitmap);
+                                                                Form1->Image2->Visible = true;
+                                                                Form1->Image1->Visible = false;
+
+                                                                Bitmap->Free();
+                                                        }
+
+                                                        }
+                                                        catch(...){Form1->Memo1->Lines->Add("jpeg error"); r_fps_err++;}
+                                                        IMG_ready = true;
+                                                }
+                                                else  {Form1->Memo1->Lines->Add("KS2 false"); r_fps_err++;}
+                                        }
+                                }
+                                else{
+                                        Form1->Memo1->Lines->Add("undefound");
+                                        currPos = 0;
+
+                                }
+                      }
+  }
+}
+
+//---------------------------------------------------------------------------
+
+DWORD WINAPI ThreadShowJPEG(LPVOID lpParam)                                         //ThreadRead
+{
+
+ while(1)
+  {
+      if (IMG_ready)    {
+
+        try{
+        //as->Seek(0,0);
+        //jpeg->LoadFromStream(as);
+
+        Form1->DoubleBuffered=true;
+        if(jpeg2->Height<100) {Form1->Memo1->Lines->Add("Error JPEG"); return -1; }
+        //jpeg->Compress();
+
+
+        Form1->Image1->Picture->Bitmap->Assign(jpeg2);
+        //Form1->Image1->Picture->Assign(jpeg);
+        }
+        catch(...){Form1->Memo1->Lines->Add("jpeg error"); }
+
+
+
+
+
+
+         IMG_ready = false;
+      }
+  }
+}
+
+//---------------------------------------------------------------------------
+
+
+
+
+//---------------------------------------------------------------------------     //Start
+__fastcall TForm1::TForm1(TComponent* Owner)
+        : TForm(Owner)
+{
+Find_Com();
+Form1->Button1->Enabled = true;
+Form1->Button2->Enabled = false;
+
+
+
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::Button1Click(TObject *Sender)                           //Connect
+{
+
+if(COMOpen(Form1->ComboBox1->Text) != 0) return;
+
+Form1->Memo1->Lines->Add("COM Port Opened");
+
+Form1->Button1->Enabled = false;  
+Form1->Button2->Enabled = true;
+Form1->Button3->Enabled = false;
+Form1->Button4->Enabled = true;
+Form1->Button5->Enabled = true;
+Form1->Button6->Enabled = true;
+
+
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::Button2Click(TObject *Sender)                          //Disconnect
+{
+COMClose();
+
+ CloseHandle(COMport);
+
+Form1->Memo1->Lines->Add("COM Port Closed");
+Form1->Button1->Enabled = true;
+Form1->Button2->Enabled = false;  
+Form1->Button3->Enabled = true;
+
+Form1->Button4->Enabled = false;
+Form1->Button5->Enabled = false;
+Form1->Button6->Enabled = false;
+
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::Timer1Timer(TObject *Sender)                            // Timer
+{
+AnsiString tempStr1 = "", tempStr2 = "";
+tempStr1 += r_fps;
+tempStr1 += "/";
+tempStr1 += (r_fps_err+r_fps);
+tempStr1 += " fps";
+
+
+tempStr2 += r_bitrate;
+tempStr2 +=  " bps";
+
+Form1->Label1->Caption = tempStr1;
+Form1->Label2->Caption = tempStr2;
+
+
+r_fps = 0;
+r_fps_err = 0;
+r_bitrate = 0;
+}
+//---------------------------------------------------------------------------
+
+
+void __fastcall TForm1::Button3Click(TObject *Sender)
+{
+if (COMport == 0) Find_Com();
+}
+//---------------------------------------------------------------------------
+
+
+void Get_IMG(void)
+{
+//unsigned char TX_BUF[9] = {0xFF, 0x02, 'J', 'P', 'E', 'G', 'G', 'G', 'G'};
+unsigned char TX_BUF[9+100] = {0xFF, 0x03, 'J', 'P', 'E', 'G', 'G', 'E', 'T'};
+DWORD temp, signal;
+bool fl=0;
+
+
+int tt = 0;
+for (tt = 10; tt<100; tt++)TX_BUF[tt] = 0xFF;
+
+
+WriteFile(COMport, TX_BUF, 64, &temp, &overlappedwr);    //WriteFile(COMport, TX_BUF, 9, &temp, &overlappedwr);                             //NO CORRECT
+
+   signal = WaitForSingleObject(overlappedwr.hEvent, INFINITE);
+ if((signal == WAIT_OBJECT_0) && (GetOverlappedResult(COMport, &overlappedwr, &temp, true))) fl = true;
+ else fl = false;
+}
+
+
+void __fastcall TForm1::Timer2Timer(TObject *Sender)
+{
+        Get_IMG ();
+}
+//---------------------------------------------------------------------------
+
+bool pushed = false;
+
+
+void __fastcall TForm1::Timer3Timer(TObject *Sender)
+{
+        PurgeComm(COMport, PURGE_RXCLEAR);
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::Button4Click(TObject *Sender)
+{
+        unsigned char TX_BUF[14+100] = {0x02, 'J', 'P', 'E', 'G', 'S', 'E', 'T', '1', '2', '3', '4', '5', '6'};
+        unsigned char TX_crc = 0;
+        DWORD temp, signal;
+        bool fl=0;
+
+        for (int i=0; i<=7; i++) TX_crc ^= TX_BUF[i];
+        TX_BUF[8] = 0x03;  TX_crc ^= TX_BUF[8];
+
+        TX_BUF[9] = 0x00;  TX_crc ^= TX_BUF[9];                                                 //cmd 0
+
+        if(strcmp(Form1->ComboBox2->Text.c_str(), "320x240")==0) TX_BUF[10] = 0x1;
+        else if(strcmp(Form1->ComboBox2->Text.c_str(), "640x480")==0)  TX_BUF[10] = 0x2;
+        else if(strcmp(Form1->ComboBox2->Text.c_str(), "800x600")==0)  TX_BUF[10] = 0x3;
+        else if(strcmp(Form1->ComboBox2->Text.c_str(), "1024x768")==0)  TX_BUF[10] = 0x4;
+        else if(strcmp(Form1->ComboBox2->Text.c_str(), "1280x1024")==0)  TX_BUF[10] = 0x5;
+        else if(strcmp(Form1->ComboBox2->Text.c_str(), "1600x1200")==0)  TX_BUF[10] = 0x6;
+        else /*if(strcmp(Form1->sComboBox2->Text.c_str(), "800x600")==0)*/ TX_BUF[10] = 0x3;
+
+        TX_crc ^= TX_BUF[10];
+
+        TX_BUF[11] = 0x44;  TX_crc ^= TX_BUF[11];
+
+
+        if((atoi(Form1->Edit1->Text.c_str()) < 1) || (atoi(Form1->Edit1->Text.c_str()) >63)) Form1->Edit1->Text =55;
+        TX_BUF[12] = atoi(Form1->Edit1->Text.c_str());  TX_crc ^= TX_BUF[12];
+        Form1->Memo1->Lines->Add(TX_BUF[12]);
+
+        //Color Saturation
+        TX_BUF[13] = 0x1;
+        TX_crc ^= TX_BUF[13];
+        if(Form1->CheckBox2->Checked)  {
+                TX_BUF[14] = 0;
+                TX_crc ^= TX_BUF[14];
+        }
+        else {
+                TX_BUF[14] = 0x48;
+                TX_crc ^= TX_BUF[14];
+        }
+
+
+
+        TX_BUF[15] = TX_crc;
+
+        int tt = 0;
+        for (tt = 16; tt<100; tt++)TX_BUF[tt] = 0xFF;
+
+        WriteFile(COMport, TX_BUF, 64, &temp, &overlappedwr);
+        signal = WaitForSingleObject(overlappedwr.hEvent, INFINITE);
+        if((signal == WAIT_OBJECT_0) && (GetOverlappedResult(COMport, &overlappedwr, &temp, true))) fl = true;
+        else fl = false;
+
+        Form1->Memo1->Lines->Add(TX_BUF[9]);
+
+
+        Form1->Timer2->Interval = 1000 / atoi(Form1->Edit2->Text.c_str() ) ;             // set timeout video
+        
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::Button5Click(TObject *Sender)
+{
+        IMG_save = true;
+        Get_IMG();
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::Button6Click(TObject *Sender)
+{
+        if (pushed){Form1->Timer2->Enabled = false;  Form1->Button6->Caption = "Video";    pushed = false;  }
+        else {Form1->Timer2->Enabled = true; Form1->Button6->Caption = "PlayBack..";   IMG_ready = true;  pushed = true;}
+
+        pushed != pushed;
+}
+//---------------------------------------------------------------------------
+
+
